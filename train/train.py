@@ -301,7 +301,7 @@ def predictwords(rt, re, rm, summary, encoder, decoder, lang, embedding_size,
             break
 
     # Get decoded_words and decoder_attetntions
-    decoded_words = [lang.index2word[w] for w in beams[0][1][1:]]
+    decoded_words = [lang.index2word[int(w)] for w in beams[0][1][1:]]
     decoder_attentions = beams[0][3]
     return decoded_words, decoder_attentions[:len(decoded_words)]
 
