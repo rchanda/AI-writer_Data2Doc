@@ -9,10 +9,11 @@ from settings import use_cuda, MAX_LENGTH, LAYER_DEPTH, TOCOPY
 
 
 class Seq2Seq(object):
-    def __init__(self, encoder, decoder, train_func, criterion, embedding_size, langs):
+    def __init__(self, encoder, decoder, train_func, decode_func, criterion, embedding_size, langs):
         self.encoder = encoder
         self.decoder = decoder
         self.train_func = train_func
+        self.decode_func = decode_func
         self.criterion = criterion
         self.embedding_size = embedding_size
         self.langs = langs
@@ -30,6 +31,12 @@ class Seq2Seq(object):
     def eval(self):
         self.encoder.eval()
         self.decoder.eval()
+
+    def seq_decode(self, rt, re, rm, beam_size):
+        """The function to decode the sentences."""
+        return self.decode_func(rt, re, rm,
+                                self.encoder, self.decoder,
+                                self.embedding_size, self.langs, beam_size)
 
 
 class docEmbedding(nn.Module):
@@ -133,13 +140,11 @@ class EncoderLIN(nn.Module):
             return result
 
 
-class HierarchicalRNN(nn.Module):
-    def __init__(self, hidden_size, local_embed, n_layers=LAYER_DEPTH):
-        super(HierarchicalRNN, self).__init__()
-        self.LocalEncoder = EncoderRNN(hidden_size, local_embed,
-                                       n_layers=n_layers, level='local')
-        self.GlobalEncoder = EncoderRNN(hidden_size, None,
-                                        n_layers=n_layers, level='global')
+class HierarchicalEncoderRNN(nn.Module):
+    def __init__(self, hidden_size, local_embed):
+        super(HierarchicalEncoderRNN, self).__init__()
+        self.LocalEncoder = EncoderRNN(hidden_size, local_embed, level='local')
+        self.GlobalEncoder = EncoderRNN(hidden_size, None, level='global')
 
 
 class EncoderRNN(nn.Module):
@@ -177,6 +182,14 @@ class EncoderRNN(nn.Module):
             return result
 
 
+class HierarchicalBiLSTM(nn.Module):
+    """"""
+    def __init__(self, hidden_size, local_embed):
+        super(HierarchicalBiLSTM, self).__init__()
+        self.LocalEncoder = EncoderBiLSTMMaxPool(hidden_size, local_embed, level='local')
+        self.GlobalEncoder = EncoderBiLSTMMaxPool(hidden_size, None, level='global')
+
+
 class EncoderBiLSTM(nn.Module):
     """Vanilla encoder using pure LSTM."""
     def __init__(self, hidden_size, embedding_layer, n_layers=LAYER_DEPTH, level='local'):
@@ -201,9 +214,9 @@ class EncoderBiLSTM(nn.Module):
         # lstm needs: (seq_len, batch, input_size)
         bilstm_outs, nh = self.bilstm(inp, hidden)
         # bilstm_outs: (seq_len, batch, hidden_size * num_directions )
-        # output = torch.transpose(bilstm_outs, 0, 1)
-        # output = torch.transpose(output, 1, 2)
-        # output = F.tanh(output)
+        #output = torch.transpose(bilstm_outs, 0, 1)
+        #output = torch.transpose(output, 1, 2)
+        #output = F.tanh(output)
         # output = F.max_pool1d(output, output.size(2)).squeeze(2)
         # Ken modified the output order (original is output, bilstm_out)
         return bilstm_outs, nh
@@ -215,16 +228,6 @@ class EncoderBiLSTM(nn.Module):
             return (forward.cuda(), backward.cuda())
         else:
             return (forward, backward)
-
-
-class HierarchicalBiLSTM(nn.Module):
-    """"""
-    def __init__(self, hidden_size, local_embed, n_layers=LAYER_DEPTH):
-        super(HierarchicalBiLSTM, self).__init__()
-        self.LocalEncoder = EncoderBiLSTMMaxPool(hidden_size, local_embed,
-                                                 n_layers=n_layers, level='local')
-        self.GlobalEncoder = EncoderBiLSTMMaxPool(hidden_size, None,
-                                                  n_layers=n_layers, level='global')
 
 
 class EncoderBiLSTMMaxPool(nn.Module):
@@ -251,8 +254,8 @@ class EncoderBiLSTMMaxPool(nn.Module):
         # lstm needs: (seq_len, batch, input_size)
         bilstm_outs, nh = self.bilstm(inp, hidden)
         # bilstm_outs: (seq_len, batch, hidden_size * num_directions )
-        output = bilstm_outs.permute(1, 2, 0)
-        # bilstm_outs: (batch, hidden_size * num_directions, seq_len)
+        output = bilstm_outs.permute(1,2,0)
+        # bilstm_outs: (batch, hidden_size * num_directions, seq_len)        
         output = F.max_pool1d(output, output.size(2)).squeeze(2)
         # Ken modified the output order (original is output, bilstm_out)
         return bilstm_outs, output
@@ -264,7 +267,6 @@ class EncoderBiLSTMMaxPool(nn.Module):
             return (forward.cuda(), backward.cuda())
         else:
             return (forward, backward)
-
 
 class PGenLayer(nn.Module):
     def __init__(self, emb_dim, hidden_size, enc_dim):
@@ -286,8 +288,7 @@ class PGenLayer(nn.Module):
 
 class AttnDecoderRNN(nn.Module):
     """This is a plain decoder with attention."""
-    def __init__(self, hidden_size, output_size, n_layers=LAYER_DEPTH, 
-                 dropout_p=0.1, copy=TOCOPY):
+    def __init__(self, hidden_size, output_size, n_layers=LAYER_DEPTH, dropout_p=0.1, copy=TOCOPY):
         super(AttnDecoderRNN, self).__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
@@ -343,13 +344,10 @@ class HierarchicalDecoder(nn.Module):
     This module is for encapsulating the Hierarchical decoder part.
 
     """
-    def __init__(self, hidden_size, output_size,
-                 n_layers=LAYER_DEPTH, copy=TOCOPY):
-
+    def __init__(self, hidden_size, output_size, copy=True):
         super(HierarchicalDecoder, self).__init__()
-        self.global_decoder = GlobalAttnDecoderRNN(hidden_size, n_layers=n_layers)
-        self.local_decoder = LocalAttnDecoderRNN(hidden_size, output_size,
-                                                 n_layers=n_layers, copy=copy)
+        self.global_decoder = GlobalAttnDecoderRNN(hidden_size)
+        self.local_decoder = LocalAttnDecoderRNN(hidden_size, output_size, copy=copy)
 
 
 class GlobalAttnDecoderRNN(nn.Module):
@@ -407,6 +405,7 @@ class LocalAttnDecoderRNN(nn.Module):
         self.dropout_p = dropout_p
         self.max_length = max_length
         self.copy = copy
+
         self.embedding = nn.Embedding(self.output_size, self.hidden_size)
         self.attn = Attn(hidden_size)
 
